@@ -3,6 +3,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
 
+import events.*;
 import models.*;
 import models.Record;
 
@@ -15,6 +16,7 @@ public class Cache<K, V> {
     private final ConcurrentSkipListMap<AccessDetails, List<K>> priorityQueue;
     private final ConcurrentSkipListMap<Long, List<K>> expiryQueue;
     private final Timer timer;
+    private final List<Event<K, V>> eventQueue;
 
     public Cache(int maximumSize,
                  PersistAlgorithm persistAlgorithm,
@@ -28,6 +30,7 @@ public class Cache<K, V> {
         this.dataSource = dataSource;
         this.timer = timer;
         this.cache = new ConcurrentHashMap<>();
+        this.eventQueue = new CopyOnWriteArrayList<>();
         priorityQueue = new ConcurrentSkipListMap<>((first, second) -> {
             final int accessTimeDiff = (int) (first.getLastAccessTime() - second.getLastAccessTime());
             if(evictionAlgorithm.equals(EvictionAlgorithm.LRU)){
@@ -57,6 +60,7 @@ public class Cache<K, V> {
                 if(hasExpired(record)){
                     priorityQueue.get(record.getAccessDetails()).remove(key);
                     expiryQueue.get(record.getInsertionTime()).remove(key);
+                    eventQueue.add(new Eviction<>(record, timer.getCurrentTime(), Eviction.Type.EXPIRY));
                     return addToCache(key, loadFromDB(dataSource, key));
                 }else{
                     return CompletableFuture.completedFuture(record);
@@ -79,6 +83,11 @@ public class Cache<K, V> {
             result = cache.remove(key).thenAccept(oldRecord -> {
                 priorityQueue.get(oldRecord.getAccessDetails()).remove(key);
                 expiryQueue.get(oldRecord.getInsertionTime()).remove(key);
+                if(hasExpired(oldRecord)){
+                    eventQueue.add(new Eviction<>(oldRecord, timer.getCurrentTime(), Eviction.Type.EXPIRY));
+                }else{
+                    eventQueue.add(new Update<>(new Record<>(key, value, timer.getCurrentTime()), timer.getCurrentTime(), oldRecord))
+                }
             });
         }
         return result.thenCompose(__ -> addToCache(key, CompletableFuture.completedFuture(value)))
@@ -105,6 +114,7 @@ public class Cache<K, V> {
                 for(K key : listKeys){
                     Record<K, V> expiredRecord = cache.remove(key).toCompletableFuture().join();
                     priorityQueue.remove(expiredRecord.getAccessDetails());
+                    eventQueue.add(new Eviction<>(expiredRecord, timer.getCurrentTime(), Eviction.Type.EXPIRY));
                 }
             }
         }
@@ -116,12 +126,17 @@ public class Cache<K, V> {
             for(K key : listKeys){
                 Record<K, V> lowestPriorityRecord = cache.remove(key).toCompletableFuture().join();
                 expiryQueue.get(lowestPriorityRecord.getInsertionTime()).remove(lowestPriorityRecord.getKey());
+                eventQueue.add(new Eviction<>(lowestPriorityRecord, timer.getCurrentTime(), Eviction.Type.REPLACEMENT));
             }
         }
     }
 
     private CompletionStage<V> loadFromDB(DataSource<K,V> dataSource, K key) {
-        return dataSource.load(key);
+        return dataSource.load(key).whenComplete((value, throwable) -> {
+            if(throwable == null){
+                eventQueue.add(new Load<>(new Record<>(key, value, timer.getCurrentTime()), timer.getCurrentTime()));
+            }
+        });
     }
 
     private boolean hasExpired(Record<K,V> record) {
@@ -133,6 +148,7 @@ public class Cache<K, V> {
     }
 
     private CompletionStage<Void> persistInDB(Record<K, V> record){
-        return dataSource.persist(record.getKey(), record.getValue(), record.getInsertionTime());
+        return dataSource.persist(record.getKey(), record.getValue(), record.getInsertionTime())
+                .thenAccept(__ -> eventQueue.add(new Write<>(record, timer.getCurrentTime())));
     }
 }
