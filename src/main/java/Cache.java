@@ -2,6 +2,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
+import java.util.function.Function;
 
 import events.*;
 import models.*;
@@ -17,13 +18,15 @@ public class Cache<K, V> {
     private final ConcurrentSkipListMap<Long, List<K>> expiryQueue;
     private final Timer timer;
     private final List<Event<K, V>> eventQueue;
+    private final ExecutorService[] executorPool;
 
     public Cache(int maximumSize,
                  PersistAlgorithm persistAlgorithm,
                  EvictionAlgorithm evictionAlgorithm,
                  Duration expiryTime,
                  DataSource<K, V> dataSource,
-                 Timer timer) {
+                 Timer timer,
+                 int poolSize) {
         this.maximumSize = maximumSize;
         this.persistAlgorithm = persistAlgorithm;
         this.expiryTime = expiryTime;
@@ -41,14 +44,21 @@ public class Cache<K, V> {
             }
         });
         expiryQueue = new ConcurrentSkipListMap<>();
+        this.executorPool = new ExecutorService[poolSize];
+        for(int i=0;i<poolSize;i++){
+            executorPool[i] = Executors.newSingleThreadExecutor();
+        }
     }
 
+    private <U> CompletionStage<U> getThread(K key, CompletionStage<U> task){
+        return CompletableFuture.supplyAsync(() -> task, executorPool[Math.abs(key.hashCode() % executorPool.length)]).thenCompose(Function.identity());
+    }
     public CompletionStage<V> get(K key){
-        return getFromCache(key);
+        return getThread(key, getFromCache(key));
     }
 
     public CompletionStage<Void> set(K key, V value){
-        return setInCache(key, value);
+        return getThread(key, setInCache(key, value));
     }
 
     public CompletionStage<V> getFromCache(K key){
