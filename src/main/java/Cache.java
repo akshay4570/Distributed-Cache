@@ -167,4 +167,8 @@ public class Cache<K, V> {
         return dataSource.persist(record.getKey(), record.getValue(), record.getInsertionTime())
                 .thenAccept(__ -> eventQueue.add(new Write<>(record, timer.getCurrentTime())));
     }
+
+    public List<Event<K, V>> getEventQueue() {
+        return eventQueue;
+    }
 }
