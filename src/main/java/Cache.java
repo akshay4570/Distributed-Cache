@@ -1,6 +1,7 @@
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.*;
 import java.util.function.Function;
 
@@ -26,7 +27,8 @@ public class Cache<K, V> {
                  Duration expiryTime,
                  DataSource<K, V> dataSource,
                  Timer timer,
-                 int poolSize) {
+                 int poolSize,
+                 Set<K> keysToHotLoad) {
         this.maximumSize = maximumSize;
         this.persistAlgorithm = persistAlgorithm;
         this.expiryTime = expiryTime;
@@ -48,6 +50,10 @@ public class Cache<K, V> {
         for(int i=0;i<poolSize;i++){
             executorPool[i] = Executors.newSingleThreadExecutor();
         }
+        final var eagerLoading = keysToHotLoad.stream()
+                .map(key -> getThread(key, addToCache(key, loadFromDB(dataSource, key))))
+                .toArray(CompletableFuture[]::new);
+        CompletableFuture.allOf(eagerLoading).join();
     }
 
     private <U> CompletionStage<U> getThread(K key, CompletionStage<U> task){
@@ -96,7 +102,7 @@ public class Cache<K, V> {
                 if(hasExpired(oldRecord)){
                     eventQueue.add(new Eviction<>(oldRecord, timer.getCurrentTime(), Eviction.Type.EXPIRY));
                 }else{
-                    eventQueue.add(new Update<>(new Record<>(key, value, timer.getCurrentTime()), timer.getCurrentTime(), oldRecord))
+                    eventQueue.add(new Update<>(new Record<>(key, value, timer.getCurrentTime()), timer.getCurrentTime(), oldRecord));
                 }
             });
         }
